@@ -202,6 +202,42 @@ class TaskSchedulingEnvTests(unittest.TestCase):
         self.assertEqual(observation["candidate_features"].shape, (4, env.CANDIDATE_FEATURE_DIM))
         self.assertEqual(len(env._candidate_machine_ids), 4)
 
+    def test_observation_dimensions_include_deadline_and_completion_features(self) -> None:
+        env = self._make_env()
+        observation, _ = env.reset(options={"episode_id": 0})
+        self.assertEqual(observation["task_features"].shape, (env.TASK_FEATURE_DIM,))
+        self.assertEqual(observation["fleet_summary"].shape, (env.FLEET_SUMMARY_DIM,))
+        self.assertGreaterEqual(float(observation["task_features"][8]), 0.0)
+        self.assertGreaterEqual(float(observation["task_features"][9]), 0.0)
+
+    def test_effective_max_steps_scales_with_episode_size(self) -> None:
+        env = self._make_env(max_steps=5)
+        env.reset(options={"episode_id": 0})
+        self.assertEqual(env._effective_max_steps, 12)
+
+    def test_feasible_assignment_adds_deadline_bonus_when_on_time(self) -> None:
+        env = self._make_env()
+        observation, _ = env.reset(options={"episode_id": 1})
+        action = self._pick_first_feasible_action(observation)
+        _, _, _, _, info = env.step(action)
+        self.assertIn("deadline_met_bonus", info["reward_components"])
+
+    def test_terminal_completion_bonus_tracks_scheduled_tasks(self) -> None:
+        trunc_env = self._make_env(max_steps=20, max_consecutive_defers=1, invalid_action_limit=10)
+        trunc_env.reset(options={"episode_id": 0})
+        _, _, _, truncated, trunc_info = trunc_env.step(trunc_env.defer_action)
+        self.assertTrue(truncated)
+        self.assertEqual(trunc_info["reward_components"]["terminal_completion_bonus"], -2.0)
+        self.assertEqual(trunc_info["reward_components"]["terminal_on_time_bonus"], -5.0)
+
+        term_env = self._make_env()
+        observation, _ = term_env.reset(options={"episode_id": 1})
+        action = self._pick_first_feasible_action(observation)
+        _, _, terminated, _, term_info = term_env.step(action)
+        self.assertTrue(terminated)
+        self.assertEqual(term_info["reward_components"]["terminal_completion_bonus"], 2.0)
+        self.assertEqual(term_info["reward_components"]["terminal_on_time_bonus"], 5.0)
+
     def test_terminated_and_truncated_are_separate(self) -> None:
         env = self._make_env()
         observation, _ = env.reset(options={"episode_id": 1})

@@ -1,0 +1,8 @@
+cff-version: 1.2.0
+title: RL-Based Cloud Task Scheduler
+message: If you use this project, please cite it using this metadata.
+type: software
+authors:
+  - family-names: Arnav
+repository-code: https://github.com/Arnav-Nehra28/AI-Based-Deadline-Aware-OS-Scheduler
+license: MIT

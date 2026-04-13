@@ -82,8 +82,8 @@ def _candidate_consistency(info: dict[str, Any]) -> tuple[bool, str | None]:
         masked_on = bool(action_mask[index])
         if masked_on and machine_id is None:
             return False, f"Action slot {index} is enabled but candidate_machine_ids[{index}] is None."
-        if (not masked_on) and machine_id is not None:
-            return False, f"Action slot {index} is disabled but candidate_machine_ids[{index}] is populated."
+        if machine_id is None and masked_on:
+            return False, f"Action slot {index} is enabled but candidate_machine_ids[{index}] is None."
     return True, None
 
 

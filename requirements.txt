@@ -1,0 +1,20 @@
+# Core scientific stack
+numpy
+pandas
+scikit-learn
+
+# RL environment and training
+gymnasium
+stable-baselines3
+sb3-contrib
+
+# Plotting and reporting
+matplotlib
+seaborn
+
+# Baseline / auxiliary modeling
+xgboost
+joblib
+
+# Optional but useful for local training dashboards
+tensorboard

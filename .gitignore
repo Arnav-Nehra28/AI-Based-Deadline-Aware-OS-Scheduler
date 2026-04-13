@@ -8,12 +8,18 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.pip-cache/
 
 # Local Codex state
 .codex
 
 # Jupyter
 .ipynb_checkpoints/
+data_preprocessing/legacy_minor_project_preprocessing.ipynb
+
+# Python build/cache noise
+**/__pycache__/
+*.egg-info/
 
 # Data artifacts
 data/raw/
@@ -22,9 +28,16 @@ data/processed/
 data/reports/
 
 # Experiment outputs
+artifacts/
 results/
 *.pkl
 *.log
+modeling/training_log.txt
+
+# Generated reports / model outputs
+*.pdf
+*.zip
+*.npz
 
 # OS/editor noise
 .DS_Store
