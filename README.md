@@ -30,7 +30,6 @@ This repository includes:
 .
 ├── README.md
 ├── LICENSE
-├── CONTRIBUTING.md
 ├── requirements.txt
 ├── data_preprocessing/
 ├── rl_pipeline/
