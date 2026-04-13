@@ -3,6 +3,11 @@ title: RL-Based Cloud Task Scheduler
 message: If you use this project, please cite it using this metadata.
 type: software
 authors:
-  - family-names: Arnav
+  - family-names: Nehra
+    given-names: Arnav
+  - family-names: Thakur
+    given-names: Rahul
+  - family-names: Thakur
+    given-names: Uday
 repository-code: https://github.com/Arnav-Nehra28/AI-Based-Deadline-Aware-OS-Scheduler
 license: MIT

@@ -149,6 +149,12 @@ Core metrics include:
 - `data_preprocessing/README.md`
 - `walkthrough.md`
 
+## Authors
+
+- Arnav Nehra
+- Rahul Thakur
+- Uday Thakur
+
 ## License
 
 This project is released under the MIT License. See `LICENSE`.
