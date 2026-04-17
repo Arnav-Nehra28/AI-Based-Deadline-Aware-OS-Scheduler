@@ -59,6 +59,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deadline-slack-factor", type=float, default=2.0)
 
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--learning-rate-schedule", type=str, choices=["constant", "warmup_cosine"], default="constant")
+    parser.add_argument("--lr-warmup-steps", type=int, default=50_000)
+    parser.add_argument("--lr-min", type=float, default=1e-5)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--n-steps", type=int, default=1024)
@@ -69,6 +72,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--policy-hidden-dims", type=str, default="256,256")
+    parser.add_argument("--features-extractor", type=str, choices=["default", "attention"], default="default")
+    parser.add_argument("--features-dim", type=int, default=256)
+    parser.add_argument("--attention-task-hidden-dim", type=int, default=128)
+    parser.add_argument("--attention-candidate-hidden-dim", type=int, default=128)
+    parser.add_argument("--attention-fleet-hidden-dim", type=int, default=64)
+    parser.add_argument("--attention-heads", type=int, default=4)
+    parser.add_argument("--attention-dropout", type=float, default=0.1)
+    parser.add_argument("--reward-defer-penalty", type=float, default=None)
+    parser.add_argument("--reward-defer-escalation-rate", type=float, default=None)
+    parser.add_argument("--reward-wait-penalty-weight", type=float, default=None)
+    parser.add_argument("--reward-turnaround-penalty-weight", type=float, default=None)
+    parser.add_argument("--reward-utilization-bonus-weight", type=float, default=None)
+    parser.add_argument("--reward-idle-machine-penalty-weight", type=float, default=None)
     return parser
 
 
@@ -182,6 +198,12 @@ def main() -> None:
         str(float(args.deadline_slack_factor)),
         "--learning-rate",
         str(float(args.learning_rate)),
+        "--learning-rate-schedule",
+        str(args.learning_rate_schedule),
+        "--lr-warmup-steps",
+        str(int(args.lr_warmup_steps)),
+        "--lr-min",
+        str(float(args.lr_min)),
         "--gamma",
         str(float(args.gamma)),
         "--gae-lambda",
@@ -202,6 +224,20 @@ def main() -> None:
         str(float(args.max_grad_norm)),
         "--policy-hidden-dims",
         str(args.policy_hidden_dims),
+        "--features-extractor",
+        str(args.features_extractor),
+        "--features-dim",
+        str(int(args.features_dim)),
+        "--attention-task-hidden-dim",
+        str(int(args.attention_task_hidden_dim)),
+        "--attention-candidate-hidden-dim",
+        str(int(args.attention_candidate_hidden_dim)),
+        "--attention-fleet-hidden-dim",
+        str(int(args.attention_fleet_hidden_dim)),
+        "--attention-heads",
+        str(int(args.attention_heads)),
+        "--attention-dropout",
+        str(float(args.attention_dropout)),
     ]
     if args.init_model_path is not None:
         command.extend(["--init-model-path", str(Path(args.init_model_path))])
@@ -209,6 +245,18 @@ def main() -> None:
         command.extend(["--machine-pool-size", str(int(args.machine_pool_size))])
     if bool(args.progress_bar):
         command.append("--progress-bar")
+    if args.reward_defer_penalty is not None:
+        command.extend(["--reward-defer-penalty", str(float(args.reward_defer_penalty))])
+    if args.reward_defer_escalation_rate is not None:
+        command.extend(["--reward-defer-escalation-rate", str(float(args.reward_defer_escalation_rate))])
+    if args.reward_wait_penalty_weight is not None:
+        command.extend(["--reward-wait-penalty-weight", str(float(args.reward_wait_penalty_weight))])
+    if args.reward_turnaround_penalty_weight is not None:
+        command.extend(["--reward-turnaround-penalty-weight", str(float(args.reward_turnaround_penalty_weight))])
+    if args.reward_utilization_bonus_weight is not None:
+        command.extend(["--reward-utilization-bonus-weight", str(float(args.reward_utilization_bonus_weight))])
+    if args.reward_idle_machine_penalty_weight is not None:
+        command.extend(["--reward-idle-machine-penalty-weight", str(float(args.reward_idle_machine_penalty_weight))])
 
     subprocess.run(command, check=True)
 

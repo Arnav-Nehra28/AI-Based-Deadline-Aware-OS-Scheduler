@@ -36,9 +36,9 @@ The environment observation is split into three parts:
 
 Current tensor shapes in the environment:
 
-- `task_features`: 8 values
+- `task_features`: 12 values
 - `candidate_features`: `top_k_candidates x 13`
-- `fleet_summary`: 12 values
+- `fleet_summary`: 18 values
 
 In simple project terms, the state represents:
 
@@ -248,6 +248,32 @@ python -m training.rl.train_ppo \
   --ent-coef 0.01
 ```
 
+Attention-based extractor (recommended for better candidate reasoning):
+
+```bash
+python -m training.rl.train_ppo \
+  --dataset data/interim/rl_env_dataset.json.gz \
+  --device cuda \
+  --run-name stress_attention_v1 \
+  --features-extractor attention \
+  --features-dim 256 \
+  --attention-heads 4 \
+  --total-timesteps 500000 \
+  --machine-capacity-scale 0.35 \
+  --machine-pool-size 32 \
+  --max-steps 500 \
+  --n-envs 8 \
+  --n-steps 2048 \
+  --batch-size 512 \
+  --n-epochs 10 \
+  --gamma 0.997 \
+  --gae-lambda 0.98 \
+  --learning-rate 1e-4 \
+  --learning-rate-schedule warmup_cosine \
+  --lr-warmup-steps 50000 \
+  --lr-min 1e-5
+```
+
 Artifacts are written under `artifacts/rl/<run_name>/`:
 
 - `final_model.zip`
@@ -265,6 +291,64 @@ python -m training.rl.evaluate_policy \
   --device cuda \
   --episodes 20 \
   --output-json artifacts/rl/eval/latest_eval.json
+```
+
+Evaluate with hybrid fallback policy:
+
+```bash
+python -m training.rl.evaluate_model \
+  --run-dir artifacts/rl/<run_name> \
+  --device cuda \
+  --include-hybrid-rl \
+  --hybrid-defer-wait-ratio-threshold 2.0 \
+  --hybrid-high-utilization-threshold 0.90
+```
+
+Run multi-seed evaluation (mean/std stability):
+
+```bash
+python -m training.rl.evaluate_multiseed \
+  --run-dir artifacts/rl/<run_name> \
+  --device cuda \
+  --seeds 13,23,37,42,77
+```
+
+## Advanced Training Entrypoints
+
+Curriculum training (easy -> medium -> stress):
+
+```bash
+python -m training.rl.train_curriculum \
+  --dataset data/interim/rl_env_dataset.json.gz \
+  --device cuda \
+  --run-name curriculum_v1 \
+  --phase-timesteps 100000,100000,200000 \
+  --phase-machine-capacity-scales 0.8,0.5,0.35 \
+  --phase-machine-pool-sizes 128,96,32 \
+  --phase-learning-rates 3e-4,1e-4,5e-5 \
+  --phase-ent-coefs 0.03,0.02,0.01
+```
+
+Population-based training search:
+
+```bash
+python -m training.rl.train_pbt \
+  --dataset data/interim/rl_env_dataset.json.gz \
+  --device cuda \
+  --population-size 6 \
+  --rounds 3 \
+  --timesteps-per-round 120000
+```
+
+Recurrent PPO baseline (LSTM policy):
+
+```bash
+python -m training.rl.train_recurrent_ppo \
+  --dataset data/interim/rl_env_dataset.json.gz \
+  --device cuda \
+  --total-timesteps 300000 \
+  --machine-capacity-scale 0.35 \
+  --machine-pool-size 32
 ```
 
 ## Train / Validate / Test / Evaluate Files

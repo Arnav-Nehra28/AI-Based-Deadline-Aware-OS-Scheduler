@@ -57,6 +57,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--invalid-action-limit", type=int, default=30)
     parser.add_argument("--machine-capacity-scale", type=float, default=1.0)
     parser.add_argument("--machine-pool-size", type=int, default=None)
+    parser.add_argument("--include-hybrid-rl", action="store_true")
+    parser.add_argument("--hybrid-defer-wait-ratio-threshold", type=float, default=2.0)
+    parser.add_argument("--hybrid-high-utilization-threshold", type=float, default=0.90)
 
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument("--output-csv", type=Path, default=None)
@@ -70,17 +73,22 @@ def _load_split_payload(path: Path) -> dict[str, object]:
 
 def _write_markdown_table(path: Path, rows: list[dict[str, object]]) -> None:
     lines = [
-        "| Scheduler | Deadline Miss Ratio | Waiting Time | Turnaround Time | CPU Utilization |",
-        "| --- | --- | --- | --- | --- |",
+        "| Scheduler | Deadline Miss Ratio | Waiting Time | Turnaround Time | CPU Utilization | Assignment Rate | Scheduled / Total |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in rows:
+        total_tasks = int(row["total_tasks"])
+        scheduled_tasks = int(row["scheduled_tasks"])
+        assignment_rate = float(scheduled_tasks / max(total_tasks, 1))
         lines.append(
             "| "
             f"{row['scheduler']} | "
             f"{row['deadline_miss_ratio']:.6f} | "
             f"{row['mean_waiting_time']} | "
             f"{row['mean_turnaround_time']} | "
-            f"{row['cpu_utilization']:.6f} |"
+            f"{row['cpu_utilization']:.6f} | "
+            f"{assignment_rate:.6f} | "
+            f"{scheduled_tasks}/{total_tasks} |"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -125,6 +133,9 @@ def main() -> None:
         invalid_action_limit=int(args.invalid_action_limit),
         machine_capacity_scale=float(args.machine_capacity_scale),
         machine_pool_size=None if args.machine_pool_size is None else int(args.machine_pool_size),
+        use_hybrid_scheduler=False,
+        hybrid_defer_wait_ratio_threshold=float(args.hybrid_defer_wait_ratio_threshold),
+        hybrid_high_utilization_threshold=float(args.hybrid_high_utilization_threshold),
     )
     fcfs_results = evaluate_heuristic_policy_on_episode_ids(
         dataset=dataset,
@@ -157,6 +168,38 @@ def main() -> None:
         comparison_row_from_summary(scheduler="RR", summary=rr_results["summary"]),
         comparison_row_from_summary(scheduler="RL Model", summary=rl_results["summary"]),
     ]
+    hybrid_results = None
+    if bool(args.include_hybrid_rl):
+        hybrid_results = evaluate_rl_policy_on_episode_ids(
+            model_path=model_path,
+            dataset=dataset,
+            episode_ids=episode_ids,
+            seed=int(args.seed),
+            device=str(args.device),
+            stochastic=bool(args.stochastic),
+            deadline_slack_factor=float(args.deadline_slack_factor),
+            top_k_candidates=int(args.top_k_candidates),
+            max_steps=int(args.max_steps),
+            max_consecutive_defers=int(args.max_consecutive_defers),
+            invalid_action_limit=int(args.invalid_action_limit),
+            machine_capacity_scale=float(args.machine_capacity_scale),
+            machine_pool_size=None if args.machine_pool_size is None else int(args.machine_pool_size),
+            use_hybrid_scheduler=True,
+            hybrid_defer_wait_ratio_threshold=float(args.hybrid_defer_wait_ratio_threshold),
+            hybrid_high_utilization_threshold=float(args.hybrid_high_utilization_threshold),
+        )
+        comparison_rows.append(
+            comparison_row_from_summary(scheduler="RL Hybrid", summary=hybrid_results["summary"])
+        )
+
+    results_by_scheduler = {
+        "FCFS": fcfs_results,
+        "SJF": sjf_results,
+        "RR": rr_results,
+        "RL": rl_results,
+    }
+    if hybrid_results is not None:
+        results_by_scheduler["RL_HYBRID"] = hybrid_results
 
     payload = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -167,14 +210,12 @@ def main() -> None:
         "deadline_slack_factor": float(args.deadline_slack_factor),
         "machine_capacity_scale": float(args.machine_capacity_scale),
         "machine_pool_size": None if args.machine_pool_size is None else int(args.machine_pool_size),
+        "include_hybrid_rl": bool(args.include_hybrid_rl),
+        "hybrid_defer_wait_ratio_threshold": float(args.hybrid_defer_wait_ratio_threshold),
+        "hybrid_high_utilization_threshold": float(args.hybrid_high_utilization_threshold),
         "episode_ids": episode_ids,
         "comparison_table": comparison_rows,
-        "results_by_scheduler": {
-            "FCFS": fcfs_results,
-            "SJF": sjf_results,
-            "RR": rr_results,
-            "RL": rl_results,
-        },
+        "results_by_scheduler": results_by_scheduler,
     }
 
     output_json.parent.mkdir(parents=True, exist_ok=True)
@@ -203,16 +244,21 @@ def main() -> None:
     print("Final evaluation complete.")
     print(f"Episode count: {len(episode_ids)}")
     print("")
-    print("| Scheduler | Deadline Miss Ratio | Waiting Time | Turnaround Time | CPU Utilization |")
-    print("| --- | --- | --- | --- | --- |")
+    print("| Scheduler | Deadline Miss Ratio | Waiting Time | Turnaround Time | CPU Utilization | Assignment Rate | Scheduled / Total |")
+    print("| --- | --- | --- | --- | --- | --- | --- |")
     for row in comparison_rows:
+        total_tasks = int(row["total_tasks"])
+        scheduled_tasks = int(row["scheduled_tasks"])
+        assignment_rate = float(scheduled_tasks / max(total_tasks, 1))
         print(
             "| "
             f"{row['scheduler']} | "
             f"{row['deadline_miss_ratio']:.6f} | "
             f"{row['mean_waiting_time']} | "
             f"{row['mean_turnaround_time']} | "
-            f"{row['cpu_utilization']:.6f} |"
+            f"{row['cpu_utilization']:.6f} | "
+            f"{assignment_rate:.6f} | "
+            f"{scheduled_tasks}/{total_tasks} |"
         )
     print("")
     print(f"Saved JSON: {output_json}")

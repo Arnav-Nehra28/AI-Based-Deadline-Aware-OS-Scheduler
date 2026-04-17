@@ -208,8 +208,8 @@ def validate_environment_behavior() -> dict[str, Any]:
     report["checks"]["resource_accounting_after_completion"] = {"passed": ok, "error": error}
 
     ok, error = _assert(
-        feasible_reward > 0 and overload_reward < defer_reward < 0,
-        "Reward ordering is wrong; expected feasible > 0, overload < defer < 0.",
+        feasible_reward > 0 and overload_reward < 0 and defer_reward < 0 and defer_reward <= overload_reward,
+        "Reward ordering is wrong; expected feasible > 0 and defer to be at least as costly as overload.",
     )
     report["checks"]["reward_signal_behavior"] = {"passed": ok, "error": error}
 

@@ -16,9 +16,9 @@ class RewardWeights:
     feasible_bonus: float = 3.0
     overload_penalty: float = -2.0
     invalid_action_penalty: float = -3.0
-    defer_penalty: float = -1.2
-    defer_escalation_rate: float = 0.15
-    wait_penalty_weight: float = 1.00
+    defer_penalty: float = -2.5
+    defer_escalation_rate: float = 0.30
+    wait_penalty_weight: float = 2.50
     missed_deadline_penalty: float = -4.0
     lateness_penalty_weight: float = 0.75
     balance_bonus_weight: float = 0.75
@@ -28,8 +28,14 @@ class RewardWeights:
     completion_bonus: float = 2.0
     deadline_met_bonus: float = 0.75
     on_time_completion_bonus: float = 5.0
-    turnaround_penalty_weight: float = 0.50
-    utilization_bonus_weight: float = 0.30
+    turnaround_penalty_weight: float = 1.50
+    utilization_bonus_weight: float = 0.80
+    idle_machine_penalty_weight: float = 0.50
+    tail_wait_cvar_weight: float = 1.20
+    defer_guard_wait_ratio_threshold: float = 1.75
+    speed_bonus_weight: float = 1.50
+    defer_guard_queue_pressure_threshold: float = 0.30
+    defer_guard_near_deadline_threshold: float = 0.25
 
 
 @dataclass(frozen=True)
@@ -38,6 +44,7 @@ class SchedulerEnvConfig:
     max_steps: int = 500
     max_consecutive_defers: int = 30
     invalid_action_limit: int = 30
+    stall_force_dispatch_steps: int = 10
     machine_capacity_scale: float = 1.0
     machine_pool_size: int | None = None
     deadline_slack_factor: float = 2.0
@@ -83,9 +90,9 @@ class TaskSchedulingEnv(Env):
 
     metadata = {"render_modes": []}
 
-    TASK_FEATURE_DIM = 12
+    TASK_FEATURE_DIM = 13
     CANDIDATE_FEATURE_DIM = 13
-    FLEET_SUMMARY_DIM = 14
+    FLEET_SUMMARY_DIM = 18
 
     def __init__(
         self,
@@ -96,6 +103,7 @@ class TaskSchedulingEnv(Env):
         max_steps: int = 500,
         max_consecutive_defers: int = 30,
         invalid_action_limit: int = 30,
+        stall_force_dispatch_steps: int = 10,
         machine_capacity_scale: float = 1.0,
         machine_pool_size: int | None = None,
         deadline_slack_factor: float = 2.0,
@@ -124,6 +132,7 @@ class TaskSchedulingEnv(Env):
             max_steps=int(max_steps),
             max_consecutive_defers=int(max_consecutive_defers),
             invalid_action_limit=int(invalid_action_limit),
+            stall_force_dispatch_steps=int(stall_force_dispatch_steps),
             machine_capacity_scale=float(machine_capacity_scale),
             machine_pool_size=None if machine_pool_size is None else int(machine_pool_size),
             deadline_slack_factor=float(deadline_slack_factor),
@@ -203,11 +212,16 @@ class TaskSchedulingEnv(Env):
         self.running_jobs: list[tuple[float, int, int, np.ndarray]] = []
         self.machine_residual = self.machine_capacities.copy()
         self.current_episode_tasks = self._episode_tables[self._episode_ids[0]].copy()
-        self._effective_max_steps = max(self.config.max_steps, len(self.current_episode_tasks) * 4)
+        self._effective_max_steps = max(self.config.max_steps, len(self.current_episode_tasks) * 6)
         self._job_counter = 0
         self.scheduled_task_count = 0
         self.deadline_met_task_count = 0
         self.deadline_missed_task_count = 0
+        self.pruned_impossible_task_count = 0
+        self._recent_assignment_events: list[dict[str, Any]] = []
+        self._last_progress_step = 0
+        self._last_progress_scheduled_count = 0
+        self._stall_force_dispatch_count = 0
 
         self._candidate_machine_indices: list[int] = []
         self._candidate_machine_ids: list[str | None] = [None] * self.config.top_k_candidates
@@ -240,11 +254,16 @@ class TaskSchedulingEnv(Env):
         self.pending_queue = []
         self.running_jobs = []
         self.machine_residual = self.machine_capacities.copy()
-        self._effective_max_steps = max(self.config.max_steps, len(self.current_episode_tasks) * 4)
+        self._effective_max_steps = max(self.config.max_steps, len(self.current_episode_tasks) * 6)
         self._job_counter = 0
         self.scheduled_task_count = 0
         self.deadline_met_task_count = 0
         self.deadline_missed_task_count = 0
+        self.pruned_impossible_task_count = 0
+        self._recent_assignment_events = []
+        self._last_progress_step = 0
+        self._last_progress_scheduled_count = 0
+        self._stall_force_dispatch_count = 0
 
         self._advance_until_decision()
         self._refresh_decision_state()
@@ -278,9 +297,55 @@ class TaskSchedulingEnv(Env):
         action_value = int(action)
         self.step_count += 1
 
-        if action_value == self.defer_action:
-            has_feasible_candidate = any(bool(detail["is_feasible"]) for detail in self._candidate_details)
-            reward_components = self._apply_defer(has_feasible_candidate=has_feasible_candidate)
+        force_dispatch_triggered = False
+        if (
+            self._steps_since_progress() >= self.config.stall_force_dispatch_steps
+            and any(bool(detail["is_feasible"]) for detail in self._candidate_details)
+        ):
+            best_detail = max(
+                (detail for detail in self._candidate_details if bool(detail["is_feasible"])),
+                key=lambda detail: (
+                    1.5 * float(detail["fit_score"])
+                    + 1.0 * float(detail["balance_score"])
+                    + 0.5 * float(detail["fragmentation_score"])
+                ),
+            )
+            selected_machine_id = str(best_detail["machine_id"])
+            reward_components = self._apply_feasible_assignment(
+                machine_index=int(best_detail["machine_index"]),
+                task_row=decision_task,
+                candidate_detail=best_detail,
+            )
+            reward_components["stall_recovery_bonus"] = 0.5
+            was_feasible = True
+            force_dispatch_triggered = True
+            self._stall_force_dispatch_count += 1
+        elif action_value == self.defer_action:
+            # Fix-1: Force-assign override — if RL defers but a good candidate exists
+            # and the task has been waiting, override defer and assign instead.
+            override_candidate = None
+            if decision_task is not None:
+                task_wait_ratio = self._task_wait_ratio(decision_task)
+                best_score = -np.inf
+                for detail in self._candidate_details:
+                    if bool(detail["is_feasible"]):
+                        score = 1.5 * float(detail["fit_score"]) + 1.0 * float(detail["balance_score"])
+                        if score > best_score:
+                            best_score = score
+                            override_candidate = detail
+                # Override defer if task waiting >0.3× duration OR candidate is excellent
+                if override_candidate is not None and (task_wait_ratio > 0.3 or best_score > 1.5):
+                    selected_machine_id = str(override_candidate["machine_id"])
+                    reward_components = self._apply_feasible_assignment(
+                        machine_index=int(override_candidate["machine_index"]),
+                        task_row=decision_task,
+                        candidate_detail=override_candidate,
+                    )
+                    was_feasible = True
+                    override_candidate = "done"  # type: ignore[assignment]
+            if override_candidate != "done":  # type: ignore[comparison-overlap]
+                has_feasible_candidate = any(bool(detail["is_feasible"]) for detail in self._candidate_details)
+                reward_components = self._apply_defer(has_feasible_candidate=has_feasible_candidate)
         elif not self.action_space.contains(action_value) or self._action_mask[action_value] == 0:
             reward_components = self._apply_invalid_action()
         else:
@@ -296,12 +361,22 @@ class TaskSchedulingEnv(Env):
             else:
                 reward_components = self._apply_infeasible_assignment(candidate_detail=candidate_detail, task_row=decision_task)
 
+        # Fix-7: Removed max_consecutive_defers truncation — with Fix-1
+        # (force-assign) the agent can no longer defer indefinitely.
+        truncate_reason: str | None = None
+        if self.step_count >= self._effective_max_steps:
+            truncated = True
+            truncate_reason = "max_steps"
+        elif self.invalid_action_count >= self.config.invalid_action_limit:
+            truncated = True
+            truncate_reason = "invalid_action_limit"
+        else:
+            truncated = False
+
+        if not truncated:
+            self._advance_until_decision()
+        self._refresh_decision_state()
         terminated = self._is_terminated()
-        truncated = (
-            self.step_count >= self._effective_max_steps
-            or self.consecutive_defers >= self.config.max_consecutive_defers
-            or self.invalid_action_count >= self.config.invalid_action_limit
-        )
 
         if terminated or truncated:
             total_tasks = max(len(self.current_episode_tasks), 1)
@@ -314,10 +389,6 @@ class TaskSchedulingEnv(Env):
                 self.reward_weights.on_time_completion_bonus * (on_time_completion_rate * 2.0 - 1.0)
             )
 
-        if not terminated and not truncated:
-            self._advance_until_decision()
-        self._refresh_decision_state()
-
         observation = self._build_observation()
         info = self._build_info(
             decision_task=decision_task,
@@ -328,6 +399,10 @@ class TaskSchedulingEnv(Env):
             reward_components=reward_components,
             was_feasible=was_feasible,
         )
+        info["terminated"] = bool(terminated)
+        info["truncated"] = bool(truncated)
+        info["truncate_reason"] = truncate_reason
+        info["force_dispatch_triggered"] = bool(force_dispatch_triggered)
         reward = float(sum(reward_components.values()))
         return observation, reward, terminated, truncated, info
 
@@ -368,6 +443,12 @@ class TaskSchedulingEnv(Env):
         while True:
             self._release_finished_jobs(up_to=self.current_time)
             self._enqueue_arrived_tasks(up_to=self.current_time)
+            if self._prune_statically_unschedulable_pending() > 0:
+                continue
+            self._sort_pending_queue_by_duration()
+            self._promote_feasible_task_to_front()
+            if self._auto_dispatch_stale_task_if_needed():
+                continue
             if self.pending_queue:
                 return
             if self.arrival_cursor >= len(self.current_episode_tasks):
@@ -394,6 +475,9 @@ class TaskSchedulingEnv(Env):
             self.arrival_cursor += 1
 
     def _refresh_decision_state(self) -> None:
+        if self._prune_statically_unschedulable_pending() > 0:
+            self._sort_pending_queue_by_duration()
+            self._promote_feasible_task_to_front()
         self._sort_pending_queue_by_duration()
         self._promote_feasible_task_to_front()
         self._candidate_machine_indices = []
@@ -416,18 +500,117 @@ class TaskSchedulingEnv(Env):
             self._candidate_details.append(detail)
             self._action_mask[slot] = int(bool(detail["is_feasible"]))
 
-        self._action_mask[self.defer_action] = 1
+        has_feasible_candidate = any(bool(detail["is_feasible"]) for detail in self._candidate_details)
+        tail_wait_ratio = self._queue_tail_wait_ratio(alpha=0.90)
+        queue_pressure = float(len(self.pending_queue) / max(self.max_queue_size, 1))
+        near_deadline_fraction = self._fraction_tasks_near_deadline()
+        force_dispatch = (
+            has_feasible_candidate
+            and (
+                tail_wait_ratio >= self.reward_weights.defer_guard_wait_ratio_threshold
+                or queue_pressure >= self.reward_weights.defer_guard_queue_pressure_threshold
+                or near_deadline_fraction >= self.reward_weights.defer_guard_near_deadline_threshold
+            )
+        )
+        self._action_mask[self.defer_action] = 0 if force_dispatch else 1
 
     def _sort_pending_queue_by_duration(self) -> None:
         if len(self.pending_queue) <= 1:
             return
-        self.pending_queue.sort(
-            key=lambda task_position: (
-                float(self.current_episode_tasks.iloc[int(task_position)]["duration"]),
-                float(self.current_episode_tasks.iloc[int(task_position)]["arrival_time"]),
-                int(self.current_episode_tasks.iloc[int(task_position)]["task_index"]),
+
+        def priority(task_position: int) -> tuple[float, float, float, int]:
+            task_row = self.current_episode_tasks.iloc[int(task_position)]
+            duration = max(float(task_row["duration"]), 1.0)
+            deadline = self._task_deadline(task_row)
+            deadline_urgency = np.clip(1.0 - (deadline - self.current_time) / duration, 0.0, 2.0)
+            duration_priority = 1.0 - min(duration / self.max_duration, 1.0)
+            hybrid_priority = 0.6 * float(deadline_urgency) + 0.4 * float(duration_priority)
+            return (
+                -hybrid_priority,
+                duration,
+                float(task_row["arrival_time"]),
+                int(task_row["task_index"]),
             )
+
+        self.pending_queue.sort(
+            key=priority
         )
+
+    def _auto_dispatch_stale_task_if_needed(self) -> bool:
+        if not self.pending_queue:
+            return False
+
+        selected_queue_index: int | None = None
+        selected_task_row: dict[str, Any] | None = None
+        selected_candidate: dict[str, Any] | None = None
+        selected_wait_ratio = -np.inf
+
+        for queue_index, task_position in enumerate(self.pending_queue):
+            task_row_series = self.current_episode_tasks.iloc[int(task_position)]
+            wait_ratio = self._task_wait_ratio(task_row_series)
+            # Fix-4: Dynamic auto-dispatch threshold based on queue pressure
+            queue_pressure = len(self.pending_queue) / max(self.max_queue_size, 1)
+            dispatch_threshold = max(0.3, 1.0 - queue_pressure)
+            if wait_ratio <= dispatch_threshold:
+                continue
+
+            task_row = task_row_series.to_dict()
+            candidate = self._best_feasible_candidate_for_task(task_row=task_row)
+            if candidate is None:
+                continue
+
+            if wait_ratio > selected_wait_ratio:
+                selected_wait_ratio = wait_ratio
+                selected_queue_index = queue_index
+                selected_task_row = task_row
+                selected_candidate = candidate
+
+        if selected_queue_index is None or selected_task_row is None or selected_candidate is None:
+            return False
+
+        if selected_queue_index != 0:
+            selected_position = self.pending_queue.pop(selected_queue_index)
+            self.pending_queue.insert(0, selected_position)
+
+        # Force-dispatch stale feasible tasks to cap pathological defer chains.
+        self._apply_feasible_assignment(
+            machine_index=int(selected_candidate["machine_index"]),
+            task_row=selected_task_row,
+            candidate_detail=selected_candidate,
+        )
+        return True
+
+    def _best_feasible_candidate_for_task(self, task_row: dict[str, Any]) -> dict[str, Any] | None:
+        for detail in self._rank_machine_candidates(task_row=task_row):
+            if bool(detail["is_feasible"]):
+                return detail
+        return None
+
+    def _steps_since_progress(self) -> int:
+        return int(max(0, self.step_count - self._last_progress_step))
+
+    def _is_task_statically_unschedulable(self, task_row: Any) -> bool:
+        demand = np.array(
+            [task_row["cpu_demand"], task_row["mem_demand"], task_row["disk_demand"]],
+            dtype=np.float32,
+        )
+        return bool(np.any(demand > self.max_capacity_by_dim + 1e-6))
+
+    def _prune_statically_unschedulable_pending(self) -> int:
+        if not self.pending_queue:
+            return 0
+        kept: list[int] = []
+        pruned = 0
+        for task_position in self.pending_queue:
+            task_row = self.current_episode_tasks.iloc[int(task_position)]
+            if self._is_task_statically_unschedulable(task_row):
+                pruned += 1
+            else:
+                kept.append(int(task_position))
+        if pruned > 0:
+            self.pending_queue = kept
+            self.pruned_impossible_task_count += int(pruned)
+        return int(pruned)
 
     def _promote_feasible_task_to_front(self) -> None:
         if len(self.pending_queue) <= 1:
@@ -532,13 +715,16 @@ class TaskSchedulingEnv(Env):
         wait_scale = max(float(task_row["duration"]), 1.0)
         resource_pressure = float(np.mean(demand / self.max_capacity_by_dim))
         duration = max(float(task_row["duration"]), 1.0)
-        deadline = float(task_row["arrival_time"]) + self.config.deadline_slack_factor * float(task_row["duration"])
+        deadline = self._task_deadline(task_row)
         deadline_urgency = max(0.0, 1.0 - (deadline - self.current_time) / duration)
         completion_progress = float(self.scheduled_task_count / max(len(self.current_episode_tasks), 1))
         steps_remaining = max(0.0, 1.0 - self.step_count / max(self._effective_max_steps, 1))
         time_to_next_free = 0.0
         if self.running_jobs:
             time_to_next_free = max(0.0, float(self.running_jobs[0][0]) - self.current_time) / self.max_duration
+        # Laxity tells the policy how much slack remains relative to task duration.
+        laxity = deadline - self.current_time - duration
+        laxity_normalized = float(np.clip(laxity / max(duration, 1.0), -2.0, 5.0))
         task_features = np.array(
             [
                 float(demand[0] / self.max_capacity_by_dim[0]),
@@ -553,6 +739,7 @@ class TaskSchedulingEnv(Env):
                 completion_progress,
                 float(steps_remaining),
                 float(time_to_next_free),
+                laxity_normalized,
             ],
             dtype=np.float32,
         )
@@ -565,6 +752,11 @@ class TaskSchedulingEnv(Env):
             np.sum(self.machine_residual) / max(float(np.sum(self.machine_capacities_safe)), 1.0)
         )
         adequate_machines = float(np.sum(self.machine_residual[:, 0] >= demand[0])) / max(len(self.machine_ids), 1)
+        queue_wait_ratios = self._queue_wait_ratios()
+        max_waiting_time_ratio = float(max(queue_wait_ratios)) if queue_wait_ratios else 0.0
+        mean_waiting_time_ratio = float(np.mean(queue_wait_ratios)) if queue_wait_ratios else 0.0
+        fraction_tasks_near_deadline = self._fraction_tasks_near_deadline()
+        instantaneous_cpu_utilization = float(np.mean(utilization[:, 0]))
 
         fleet_summary = np.array(
             [
@@ -582,6 +774,10 @@ class TaskSchedulingEnv(Env):
                 float(self.consecutive_defers / max(self.config.max_consecutive_defers, 1)),
                 total_residual_ratio,
                 adequate_machines,
+                max_waiting_time_ratio,
+                mean_waiting_time_ratio,
+                fraction_tasks_near_deadline,
+                instantaneous_cpu_utilization,
             ],
             dtype=np.float32,
         )
@@ -593,9 +789,12 @@ class TaskSchedulingEnv(Env):
         }
 
     def _apply_defer(self, *, has_feasible_candidate: bool) -> dict[str, float]:
+        prior_time = float(self.current_time)
+        # Fix-3: Insert deferred task at queue_len/4 instead of back of queue
         if self.pending_queue:
             current_task = self.pending_queue.pop(0)
-            self.pending_queue.append(current_task)
+            insert_pos = min(len(self.pending_queue) // 4 + 1, len(self.pending_queue))
+            self.pending_queue.insert(insert_pos, current_task)
 
         self.defer_count += 1
         self.consecutive_defers += 1
@@ -612,10 +811,38 @@ class TaskSchedulingEnv(Env):
             * (1.0 + self.reward_weights.defer_escalation_rate * self.defer_count),
             "wait_penalty": -self.reward_weights.wait_penalty_weight * float(wait_time / wait_scale),
         }
-        next_event_time = self._next_external_event_time()
-        should_advance_time = (not has_feasible_candidate) or len(self.pending_queue) <= 1
-        if should_advance_time and next_event_time is not None and next_event_time > self.current_time:
-            self._advance_clock(next_event_time)
+        tail_wait_ratio = self._queue_tail_wait_ratio(alpha=0.90)
+        reward_components["tail_wait_penalty"] = -self.reward_weights.tail_wait_cvar_weight * tail_wait_ratio
+        if has_feasible_candidate:
+            machine_utilization = 1.0 - (self.machine_residual / self.machine_capacities_safe)
+            busy_mask = np.any(machine_utilization > 1e-6, axis=1)
+            idle_fraction = float(np.sum(~busy_mask) / max(len(self.machine_ids), 1))
+            reward_components["idle_machine_penalty"] = (
+                -self.reward_weights.idle_machine_penalty_weight * idle_fraction
+            )
+
+        # If nothing is feasible, advance across multiple external events in one defer step.
+        # This reduces defer loops and prevents truncation-driven tail failures.
+        if not has_feasible_candidate:
+            for _ in range(12):
+                if self._has_any_feasible_task():
+                    break
+                next_event_time = self._next_external_event_time()
+                if next_event_time is None or next_event_time <= self.current_time:
+                    break
+                self._advance_clock(next_event_time)
+                self._sort_pending_queue_by_duration()
+                self._promote_feasible_task_to_front()
+                if not self.pending_queue:
+                    break
+        elif len(self.pending_queue) <= 1:
+            next_event_time = self._next_external_event_time()
+            if next_event_time is not None and next_event_time > self.current_time:
+                self._advance_clock(next_event_time)
+
+        # Productive defers that move simulated time should not count as "stalled" defers.
+        if self.current_time > prior_time + 1e-9:
+            self.consecutive_defers = 0
         return reward_components
 
     def _apply_invalid_action(self) -> dict[str, float]:
@@ -637,6 +864,8 @@ class TaskSchedulingEnv(Env):
             "overload_penalty": self.reward_weights.overload_penalty - float(candidate_detail["overload_amount"]),
             "wait_penalty": -self.reward_weights.wait_penalty_weight * float(wait_time / wait_scale),
         }
+        tail_wait_ratio = self._queue_tail_wait_ratio(alpha=0.90)
+        reward_components["tail_wait_penalty"] = -self.reward_weights.tail_wait_cvar_weight * tail_wait_ratio
         return reward_components
 
     def _apply_feasible_assignment(
@@ -648,6 +877,8 @@ class TaskSchedulingEnv(Env):
         current_task_position = self.pending_queue.pop(0)
         assert int(task_row["task_index"]) == int(self.current_episode_tasks.iloc[current_task_position]["task_index"])
         self.scheduled_task_count += 1
+        self._last_progress_step = int(self.step_count)
+        self._last_progress_scheduled_count = int(self.scheduled_task_count)
 
         demand = np.array(
             [task_row["cpu_demand"], task_row["mem_demand"], task_row["disk_demand"]],
@@ -670,9 +901,28 @@ class TaskSchedulingEnv(Env):
         wait_time = max(0.0, float(self.current_time - float(task_row["arrival_time"])))
         wait_scale = max(float(task_row["duration"]), 1.0)
         duration = float(task_row["duration"])
-        deadline = float(task_row["arrival_time"]) + float(self.config.deadline_slack_factor) * duration
+        deadline = self._task_deadline(task_row)
         completion_time = float(self.current_time + duration)
         lateness = max(0.0, completion_time - deadline)
+        # Capture every assignment event, including internal auto-dispatches, so
+        # evaluation can compute metrics from the full executed schedule.
+        self._recent_assignment_events.append(
+            {
+                "episode_id": int(self.current_episode_id if self.current_episode_id is not None else -1),
+                "task_id": str(task_row["task_id"]),
+                "task_index": int(task_row["task_index"]),
+                "machine_id": str(candidate_detail["machine_id"]),
+                "arrival_time": float(task_row["arrival_time"]),
+                "start_time": float(self.current_time),
+                "completion_time": float(completion_time),
+                "duration": float(duration),
+                "cpu_demand": float(task_row["cpu_demand"]),
+                "wait_time": float(max(0.0, self.current_time - float(task_row["arrival_time"]))),
+                "turnaround_time": float(completion_time - float(task_row["arrival_time"])),
+                "deadline": float(deadline),
+                "missed_deadline": bool(lateness > 0.0),
+            }
+        )
         fragmentation_penalty = self.reward_weights.fragmentation_penalty_weight * max(
             0.0, 1.0 - float(candidate_detail["fragmentation_score"])
         )
@@ -705,6 +955,11 @@ class TaskSchedulingEnv(Env):
             "turnaround_penalty": -turnaround_penalty,
             "utilization_bonus": self.reward_weights.utilization_bonus_weight * mean_utilization,
         }
+        # Fix-6: Speed bonus — reward fast assignment (high when wait≈0)
+        speed_bonus = max(0.0, 1.0 - float(wait_time / wait_scale))
+        reward_components["speed_bonus"] = self.reward_weights.speed_bonus_weight * speed_bonus
+        tail_wait_ratio = self._queue_tail_wait_ratio(alpha=0.90)
+        reward_components["tail_wait_penalty"] = -self.reward_weights.tail_wait_cvar_weight * tail_wait_ratio
         if lateness > 0.0:
             self.deadline_missed_task_count += 1
             reward_components["missed_deadline_penalty"] = float(self.reward_weights.missed_deadline_penalty)
@@ -715,6 +970,56 @@ class TaskSchedulingEnv(Env):
             self.deadline_met_task_count += 1
             reward_components["deadline_met_bonus"] = self.reward_weights.deadline_met_bonus
         return reward_components
+
+    def _task_deadline(self, task_row: dict[str, Any] | Any) -> float:
+        return float(task_row["arrival_time"]) + float(self.config.deadline_slack_factor) * float(task_row["duration"])
+
+    def _task_wait_ratio(self, task_row: dict[str, Any] | Any) -> float:
+        wait_time = max(0.0, self.current_time - float(task_row["arrival_time"]))
+        duration = max(float(task_row["duration"]), 1.0)
+        return float(wait_time / duration)
+
+    def _queue_wait_ratios(self) -> list[float]:
+        return [
+            self._task_wait_ratio(self.current_episode_tasks.iloc[int(task_position)])
+            for task_position in self.pending_queue
+        ]
+
+    def _queue_tail_wait_ratio(self, *, alpha: float = 0.90) -> float:
+        wait_ratios = sorted(self._queue_wait_ratios())
+        if not wait_ratios:
+            return 0.0
+        start = int(np.clip(np.floor(alpha * len(wait_ratios)), 0, max(len(wait_ratios) - 1, 0)))
+        tail = wait_ratios[start:]
+        return float(np.mean(tail)) if tail else float(wait_ratios[-1])
+
+    def _has_any_feasible_task(self) -> bool:
+        for task_position in self.pending_queue:
+            task_row = self.current_episode_tasks.iloc[int(task_position)]
+            demand = np.array(
+                [task_row["cpu_demand"], task_row["mem_demand"], task_row["disk_demand"]],
+                dtype=np.float32,
+            )
+            feasible_mask = np.all(self.machine_residual - demand >= -1e-6, axis=1)
+            if bool(np.any(feasible_mask)):
+                return True
+        return False
+
+    def _fraction_tasks_near_deadline(self) -> float:
+        if not self.pending_queue:
+            return 0.0
+        near_deadline_count = 0
+        for task_position in self.pending_queue:
+            queued_task = self.current_episode_tasks.iloc[int(task_position)]
+            queued_duration = max(float(queued_task["duration"]), 1.0)
+            deadline_urgency = np.clip(
+                1.0 - (self._task_deadline(queued_task) - self.current_time) / queued_duration,
+                0.0,
+                2.0,
+            )
+            if deadline_urgency >= 0.8:
+                near_deadline_count += 1
+        return float(near_deadline_count / len(self.pending_queue))
 
     def _next_external_event_time(self) -> float | None:
         next_times: list[float] = []
@@ -771,7 +1076,14 @@ class TaskSchedulingEnv(Env):
         info["scheduled_task_count"] = int(self.scheduled_task_count)
         info["deadline_met_task_count"] = int(self.deadline_met_task_count)
         info["deadline_missed_task_count"] = int(self.deadline_missed_task_count)
+        info["pruned_impossible_task_count"] = int(self.pruned_impossible_task_count)
         info["completion_progress"] = float(
             self.scheduled_task_count / max(len(self.current_episode_tasks), 1)
         )
+        info["steps_since_progress"] = int(self._steps_since_progress())
+        info["stall_force_dispatch_count"] = int(self._stall_force_dispatch_count)
+        info["tail_wait_ratio"] = float(self._queue_tail_wait_ratio(alpha=0.90))
+        info["near_deadline_fraction"] = float(self._fraction_tasks_near_deadline())
+        info["assignment_events"] = [dict(row) for row in self._recent_assignment_events]
+        self._recent_assignment_events = []
         return info

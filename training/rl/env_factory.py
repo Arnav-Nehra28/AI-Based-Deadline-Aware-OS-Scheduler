@@ -6,7 +6,7 @@ from typing import Callable
 import numpy as np
 
 from rl_pipeline.env_dataset import RLEnvDataset, load_env_dataset
-from rl_pipeline.environment import TaskSchedulingEnv
+from rl_pipeline.environment import RewardWeights, TaskSchedulingEnv
 
 try:
     from data_preprocessing.pipeline_config import RL_ENV_DATASET_JSON_GZ
@@ -102,6 +102,7 @@ def build_scheduler_env(
     machine_capacity_scale: float = 1.0,
     machine_pool_size: int | None = None,
     deadline_slack_factor: float = 2.0,
+    reward_weights: RewardWeights | None = None,
     random_state: int = 42,
     randomize_on_reset: bool = True,
 ) -> TaskSchedulingEnv:
@@ -115,6 +116,7 @@ def build_scheduler_env(
         machine_capacity_scale=machine_capacity_scale,
         machine_pool_size=machine_pool_size,
         deadline_slack_factor=deadline_slack_factor,
+        reward_weights=reward_weights,
         random_state=random_state,
         randomize_on_reset=randomize_on_reset,
     )
@@ -130,6 +132,7 @@ def make_env_fn(
     machine_capacity_scale: float = 1.0,
     machine_pool_size: int | None = None,
     deadline_slack_factor: float = 2.0,
+    reward_weights: RewardWeights | None = None,
     random_state: int = 42,
     randomize_on_reset: bool = True,
     wrapper_fn: Callable[[TaskSchedulingEnv], object] | None = None,
@@ -146,6 +149,7 @@ def make_env_fn(
             machine_capacity_scale=machine_capacity_scale,
             machine_pool_size=machine_pool_size,
             deadline_slack_factor=deadline_slack_factor,
+            reward_weights=reward_weights,
             random_state=random_state,
             randomize_on_reset=randomize_on_reset,
         )

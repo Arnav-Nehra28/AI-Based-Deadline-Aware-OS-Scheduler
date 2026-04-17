@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import numpy as np
+import pandas as pd
 
 try:
     from .callbacks import SchedulerMetricsCallback
@@ -26,6 +30,9 @@ except ImportError:
         subset_dataset_by_episode_ids,
     )
     from wrappers import ActionMaskInfoWrapper
+
+from rl_pipeline.environment import RewardWeights
+from rl_pipeline.env_dataset import RLEnvDataset
 
 
 def _require_rl_dependencies() -> dict[str, Any]:
@@ -88,6 +95,209 @@ def _build_run_dir(output_root: Path, run_name: str | None = None) -> Path:
     return candidate
 
 
+def _parse_episode_ids(raw_value: str | None) -> list[int]:
+    if raw_value is None:
+        return []
+    values: list[int] = []
+    for chunk in str(raw_value).split(","):
+        token = chunk.strip()
+        if token:
+            values.append(int(token))
+    return sorted(set(values))
+
+
+def _resolve_episode_split(
+    *,
+    dataset: RLEnvDataset,
+    seed: int,
+    eval_fraction: float,
+    train_episode_ids_arg: str | None,
+    eval_episode_ids_arg: str | None,
+) -> tuple[list[int], list[int]]:
+    available_ids = sorted({int(value) for value in dataset.episodes["episode_id"].tolist()})
+    available_set = set(available_ids)
+    explicit_train = _parse_episode_ids(train_episode_ids_arg)
+    explicit_eval = _parse_episode_ids(eval_episode_ids_arg)
+
+    if not explicit_train and not explicit_eval:
+        return split_episode_ids(
+            dataset,
+            eval_fraction=float(eval_fraction),
+            seed=int(seed),
+        )
+
+    if not set(explicit_train).issubset(available_set):
+        unknown = sorted(set(explicit_train) - available_set)
+        raise ValueError(f"Unknown episode ids in --train-episode-ids: {unknown}")
+    if not set(explicit_eval).issubset(available_set):
+        unknown = sorted(set(explicit_eval) - available_set)
+        raise ValueError(f"Unknown episode ids in --eval-episode-ids: {unknown}")
+
+    train_set = set(explicit_train)
+    eval_set = set(explicit_eval)
+    if not train_set:
+        train_set = available_set - eval_set
+    if not eval_set:
+        eval_set = available_set - train_set
+
+    overlap = train_set.intersection(eval_set)
+    if overlap:
+        raise ValueError(
+            f"Train/eval episode split cannot overlap. Overlapping ids: {sorted(overlap)}"
+        )
+    if not train_set:
+        raise ValueError("Resolved train split is empty.")
+    if not eval_set:
+        raise ValueError("Resolved eval split is empty.")
+    return sorted(train_set), sorted(eval_set)
+
+
+def _oversample_hard_episodes(
+    *,
+    dataset: RLEnvDataset,
+    hard_episode_ids: list[int],
+    oversample_factor: int,
+) -> RLEnvDataset:
+    factor = max(1, int(oversample_factor))
+    hard_ids = [int(value) for value in hard_episode_ids]
+    if factor <= 1 or not hard_ids:
+        return dataset
+
+    tasks = dataset.tasks.copy().reset_index(drop=True)
+    episodes = dataset.episodes.copy().reset_index(drop=True)
+    available = set(int(value) for value in episodes["episode_id"].tolist())
+    selected = [episode_id for episode_id in hard_ids if episode_id in available]
+    if not selected:
+        return dataset
+
+    max_episode_id = int(max(available)) if available else 0
+    cloned_task_frames: list[pd.DataFrame] = []
+    cloned_episode_frames: list[pd.DataFrame] = []
+
+    for source_episode_id in selected:
+        source_tasks = tasks[tasks["episode_id"] == int(source_episode_id)].copy()
+        source_episode = episodes[episodes["episode_id"] == int(source_episode_id)].copy()
+        for clone_idx in range(factor - 1):
+            max_episode_id += 1
+            cloned_tasks = source_tasks.copy()
+            cloned_tasks["episode_id"] = int(max_episode_id)
+            cloned_tasks["task_id"] = (
+                cloned_tasks["task_id"].astype(str)
+                + f"__hardos_{source_episode_id}_{clone_idx + 1}"
+            )
+            cloned_episode = source_episode.copy()
+            cloned_episode["episode_id"] = int(max_episode_id)
+            if "source_kind" in cloned_episode.columns:
+                cloned_episode["source_kind"] = (
+                    cloned_episode["source_kind"].astype(str) + "::hard_oversample"
+                )
+            cloned_task_frames.append(cloned_tasks)
+            cloned_episode_frames.append(cloned_episode)
+
+    if not cloned_task_frames:
+        return dataset
+
+    merged_tasks = pd.concat([tasks, *cloned_task_frames], ignore_index=True)
+    merged_episodes = pd.concat([episodes, *cloned_episode_frames], ignore_index=True)
+    metadata = dict(dataset.metadata)
+    metadata["hard_episode_oversample_factor"] = int(factor)
+    metadata["hard_episode_oversampled_ids"] = selected
+    return RLEnvDataset(
+        tasks=merged_tasks,
+        machines=dataset.machines.copy(),
+        episodes=merged_episodes,
+        metadata=metadata,
+    )
+
+
+def _build_learning_rate_schedule(
+    *,
+    schedule_name: str,
+    base_learning_rate: float,
+    min_learning_rate: float,
+    warmup_steps: int,
+    total_timesteps: int,
+) -> Any:
+    normalized = str(schedule_name).strip().lower()
+    base = float(base_learning_rate)
+    lr_min = float(min_learning_rate)
+    if normalized == "constant":
+        def _constant_schedule(_: float) -> float:
+            return base
+        return _constant_schedule
+
+    if normalized != "warmup_cosine":
+        raise ValueError(
+            f"Unsupported learning-rate schedule '{schedule_name}'. "
+            "Expected one of: constant, warmup_cosine."
+        )
+
+    total_steps = max(1, int(total_timesteps))
+    warmup = max(0, min(int(warmup_steps), total_steps - 1))
+
+    def _schedule(progress_remaining: float) -> float:
+        progress = float(np.clip(progress_remaining, 0.0, 1.0))
+        current_step = (1.0 - progress) * float(total_steps)
+        if warmup > 0 and current_step < float(warmup):
+            alpha = current_step / float(warmup)
+            return float(lr_min + (base - lr_min) * alpha)
+
+        decay_denom = max(1.0, float(total_steps - warmup))
+        decay_step = max(0.0, current_step - float(warmup))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, decay_step / decay_denom)))
+        return float(lr_min + (base - lr_min) * cosine)
+
+    return _schedule
+
+
+def _resolve_reward_weights(args: argparse.Namespace) -> RewardWeights:
+    base = RewardWeights()
+    return RewardWeights(
+        feasible_bonus=base.feasible_bonus,
+        overload_penalty=base.overload_penalty,
+        invalid_action_penalty=base.invalid_action_penalty,
+        defer_penalty=base.defer_penalty
+        if args.reward_defer_penalty is None
+        else float(args.reward_defer_penalty),
+        defer_escalation_rate=base.defer_escalation_rate
+        if args.reward_defer_escalation_rate is None
+        else float(args.reward_defer_escalation_rate),
+        wait_penalty_weight=base.wait_penalty_weight
+        if args.reward_wait_penalty_weight is None
+        else float(args.reward_wait_penalty_weight),
+        missed_deadline_penalty=base.missed_deadline_penalty,
+        lateness_penalty_weight=base.lateness_penalty_weight,
+        balance_bonus_weight=base.balance_bonus_weight,
+        fragmentation_penalty_weight=base.fragmentation_penalty_weight,
+        hotspot_penalty_weight=base.hotspot_penalty_weight,
+        historical_match_bonus=base.historical_match_bonus,
+        completion_bonus=base.completion_bonus,
+        deadline_met_bonus=base.deadline_met_bonus,
+        on_time_completion_bonus=base.on_time_completion_bonus,
+        turnaround_penalty_weight=base.turnaround_penalty_weight
+        if args.reward_turnaround_penalty_weight is None
+        else float(args.reward_turnaround_penalty_weight),
+        utilization_bonus_weight=base.utilization_bonus_weight
+        if args.reward_utilization_bonus_weight is None
+        else float(args.reward_utilization_bonus_weight),
+        idle_machine_penalty_weight=base.idle_machine_penalty_weight
+        if args.reward_idle_machine_penalty_weight is None
+        else float(args.reward_idle_machine_penalty_weight),
+        tail_wait_cvar_weight=base.tail_wait_cvar_weight
+        if args.reward_tail_wait_cvar_weight is None
+        else float(args.reward_tail_wait_cvar_weight),
+        defer_guard_wait_ratio_threshold=base.defer_guard_wait_ratio_threshold
+        if args.reward_defer_guard_wait_ratio_threshold is None
+        else float(args.reward_defer_guard_wait_ratio_threshold),
+        defer_guard_queue_pressure_threshold=base.defer_guard_queue_pressure_threshold
+        if args.reward_defer_guard_queue_pressure_threshold is None
+        else float(args.reward_defer_guard_queue_pressure_threshold),
+        defer_guard_near_deadline_threshold=base.defer_guard_near_deadline_threshold
+        if args.reward_defer_guard_near_deadline_threshold is None
+        else float(args.reward_defer_guard_near_deadline_threshold),
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a MaskablePPO policy for the scheduler environment.")
     parser.add_argument("--dataset", type=Path, default=DEFAULT_RL_DATASET_PATH)
@@ -101,6 +311,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--n-envs", type=int, default=4)
     parser.add_argument("--eval-fraction", type=float, default=0.20)
+    parser.add_argument("--train-episode-ids", type=str, default=None)
+    parser.add_argument("--eval-episode-ids", type=str, default=None)
+    parser.add_argument("--hard-episode-ids", type=str, default=None)
+    parser.add_argument("--hard-episode-oversample-factor", type=int, default=1)
     parser.add_argument("--eval-episodes", type=int, default=10)
     parser.add_argument("--eval-freq", type=int, default=10_000)
     parser.add_argument("--checkpoint-freq", type=int, default=25_000)
@@ -115,6 +329,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deadline-slack-factor", type=float, default=2.0)
 
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--learning-rate-schedule", type=str, choices=["constant", "warmup_cosine"], default="constant")
+    parser.add_argument("--lr-warmup-steps", type=int, default=50_000)
+    parser.add_argument("--lr-min", type=float, default=1e-5)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--n-steps", type=int, default=1024)
@@ -125,6 +342,24 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--policy-hidden-dims", type=str, default="256,256")
+    parser.add_argument("--features-extractor", type=str, choices=["default", "attention"], default="default")
+    parser.add_argument("--features-dim", type=int, default=256)
+    parser.add_argument("--attention-task-hidden-dim", type=int, default=128)
+    parser.add_argument("--attention-candidate-hidden-dim", type=int, default=128)
+    parser.add_argument("--attention-fleet-hidden-dim", type=int, default=64)
+    parser.add_argument("--attention-heads", type=int, default=4)
+    parser.add_argument("--attention-dropout", type=float, default=0.1)
+
+    parser.add_argument("--reward-defer-penalty", type=float, default=None)
+    parser.add_argument("--reward-defer-escalation-rate", type=float, default=None)
+    parser.add_argument("--reward-wait-penalty-weight", type=float, default=None)
+    parser.add_argument("--reward-turnaround-penalty-weight", type=float, default=None)
+    parser.add_argument("--reward-utilization-bonus-weight", type=float, default=None)
+    parser.add_argument("--reward-idle-machine-penalty-weight", type=float, default=None)
+    parser.add_argument("--reward-tail-wait-cvar-weight", type=float, default=None)
+    parser.add_argument("--reward-defer-guard-wait-ratio-threshold", type=float, default=None)
+    parser.add_argument("--reward-defer-guard-queue-pressure-threshold", type=float, default=None)
+    parser.add_argument("--reward-defer-guard-near-deadline-threshold", type=float, default=None)
 
     return parser
 
@@ -152,6 +387,14 @@ def main() -> None:
     VecMonitor = dependencies["VecMonitor"]
 
     hidden_dims = _parse_hidden_dims(args.policy_hidden_dims)
+    reward_weights = _resolve_reward_weights(args)
+    lr_schedule = _build_learning_rate_schedule(
+        schedule_name=str(args.learning_rate_schedule),
+        base_learning_rate=float(args.learning_rate),
+        min_learning_rate=float(args.lr_min),
+        warmup_steps=int(args.lr_warmup_steps),
+        total_timesteps=int(args.total_timesteps),
+    )
 
     n_envs = max(1, int(args.n_envs))
     rollout_batch_size = int(args.n_steps) * n_envs
@@ -168,13 +411,22 @@ def main() -> None:
     eval_log_dir.mkdir(parents=True, exist_ok=True)
 
     dataset = load_scheduler_dataset(args.dataset)
-    train_episode_ids, eval_episode_ids = split_episode_ids(
-        dataset,
-        eval_fraction=float(args.eval_fraction),
+    train_episode_ids, eval_episode_ids = _resolve_episode_split(
+        dataset=dataset,
         seed=int(args.seed),
+        eval_fraction=float(args.eval_fraction),
+        train_episode_ids_arg=args.train_episode_ids,
+        eval_episode_ids_arg=args.eval_episode_ids,
     )
     train_dataset = subset_dataset_by_episode_ids(dataset, train_episode_ids)
     eval_dataset = subset_dataset_by_episode_ids(dataset, eval_episode_ids)
+    hard_episode_ids = _parse_episode_ids(args.hard_episode_ids)
+    hard_train_ids = [episode_id for episode_id in hard_episode_ids if episode_id in set(train_episode_ids)]
+    train_dataset = _oversample_hard_episodes(
+        dataset=train_dataset,
+        hard_episode_ids=hard_train_ids,
+        oversample_factor=int(args.hard_episode_oversample_factor),
+    )
 
     def wrap_for_training(env: Any) -> Any:
         return ActionMaskInfoWrapper(Monitor(env))
@@ -193,6 +445,7 @@ def main() -> None:
                     machine_capacity_scale=float(args.machine_capacity_scale),
                     machine_pool_size=None if args.machine_pool_size is None else int(args.machine_pool_size),
                     deadline_slack_factor=float(args.deadline_slack_factor),
+                    reward_weights=reward_weights,
                     random_state=env_seed,
                     randomize_on_reset=True,
                 )
@@ -210,6 +463,7 @@ def main() -> None:
             machine_capacity_scale=float(args.machine_capacity_scale),
             machine_pool_size=None if args.machine_pool_size is None else int(args.machine_pool_size),
             deadline_slack_factor=float(args.deadline_slack_factor),
+            reward_weights=reward_weights,
             random_state=int(args.seed) + 10_000,
             randomize_on_reset=False,
         )
@@ -221,6 +475,20 @@ def main() -> None:
             "vf": hidden_dims,
         }
     }
+    if str(args.features_extractor) == "attention":
+        try:
+            from .attention_extractor import SchedulerAttentionExtractor
+        except ImportError:
+            from attention_extractor import SchedulerAttentionExtractor
+        policy_kwargs["features_extractor_class"] = SchedulerAttentionExtractor
+        policy_kwargs["features_extractor_kwargs"] = {
+            "features_dim": int(args.features_dim),
+            "task_hidden_dim": int(args.attention_task_hidden_dim),
+            "candidate_hidden_dim": int(args.attention_candidate_hidden_dim),
+            "fleet_hidden_dim": int(args.attention_fleet_hidden_dim),
+            "attention_heads": int(args.attention_heads),
+            "attention_dropout": float(args.attention_dropout),
+        }
 
     tensorboard_log: str | None = str(run_dir / "tensorboard")
     try:
@@ -243,8 +511,8 @@ def main() -> None:
                 "n-steps must match the loaded model's rollout buffer size when fine-tuning. "
                 f"Loaded model n-steps={model.n_steps}, requested n-steps={args.n_steps}."
             )
-        model.learning_rate = float(args.learning_rate)
-        model.lr_schedule = get_schedule_fn(float(args.learning_rate))
+        model.learning_rate = lr_schedule
+        model.lr_schedule = lr_schedule
         model.batch_size = int(args.batch_size)
         model.n_epochs = int(args.n_epochs)
         model.gamma = float(args.gamma)
@@ -255,12 +523,20 @@ def main() -> None:
         model.max_grad_norm = float(args.max_grad_norm)
         model.tensorboard_log = tensorboard_log
         model.verbose = 1
+        if str(args.features_extractor) == "attention":
+            loaded_extractor_name = type(model.policy.features_extractor).__name__
+            if loaded_extractor_name != "SchedulerAttentionExtractor":
+                raise ValueError(
+                    "Loaded checkpoint is not using SchedulerAttentionExtractor, "
+                    "so attention fine-tuning cannot be enabled on this run. "
+                    f"Loaded extractor: {loaded_extractor_name}"
+                )
         print(f"Loaded initial model weights from: {args.init_model_path}")
     else:
         model = MaskablePPO(
             policy="MultiInputPolicy",
             env=train_env,
-            learning_rate=float(args.learning_rate),
+            learning_rate=lr_schedule,
             n_steps=int(args.n_steps),
             batch_size=int(args.batch_size),
             n_epochs=int(args.n_epochs),
@@ -333,6 +609,8 @@ def main() -> None:
             "dataset_path": str(Path(args.dataset)),
             "train_episode_ids": train_episode_ids,
             "eval_episode_ids": eval_episode_ids,
+            "hard_episode_ids": hard_episode_ids,
+            "hard_episode_oversample_factor": int(args.hard_episode_oversample_factor),
             "policy_hidden_dims": hidden_dims,
             "n_envs": n_envs,
         },
