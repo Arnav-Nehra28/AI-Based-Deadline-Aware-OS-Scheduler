@@ -1,4 +1,4 @@
-# RL-Based Cloud Task Scheduler
+# RL-Based Task Scheduler
 
 This repository contains a reinforcement learning pipeline for cloud task scheduling, along with the preprocessing and evaluation code used to compare the learned scheduler against standard heuristic baselines such as `FCFS`, `SJF`, and `Round Robin`.
 
