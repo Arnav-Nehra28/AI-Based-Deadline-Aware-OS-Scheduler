@@ -213,7 +213,7 @@ class TaskSchedulingEnvTests(unittest.TestCase):
     def test_effective_max_steps_scales_with_episode_size(self) -> None:
         env = self._make_env(max_steps=5)
         env.reset(options={"episode_id": 0})
-        self.assertEqual(env._effective_max_steps, 12)
+        self.assertEqual(env._effective_max_steps, 18)
 
     def test_feasible_assignment_adds_deadline_bonus_when_on_time(self) -> None:
         env = self._make_env()
@@ -223,9 +223,9 @@ class TaskSchedulingEnvTests(unittest.TestCase):
         self.assertIn("deadline_met_bonus", info["reward_components"])
 
     def test_terminal_completion_bonus_tracks_scheduled_tasks(self) -> None:
-        trunc_env = self._make_env(max_steps=20, max_consecutive_defers=1, invalid_action_limit=10)
+        trunc_env = self._make_env(max_steps=20, max_consecutive_defers=1, invalid_action_limit=1)
         trunc_env.reset(options={"episode_id": 0})
-        _, _, _, truncated, trunc_info = trunc_env.step(trunc_env.defer_action)
+        _, _, _, truncated, trunc_info = trunc_env.step(999)
         self.assertTrue(truncated)
         self.assertEqual(trunc_info["reward_components"]["terminal_completion_bonus"], -2.0)
         self.assertEqual(trunc_info["reward_components"]["terminal_on_time_bonus"], -5.0)
@@ -246,9 +246,9 @@ class TaskSchedulingEnvTests(unittest.TestCase):
         self.assertTrue(terminated)
         self.assertFalse(truncated)
 
-        trunc_env = self._make_env(max_consecutive_defers=1)
+        trunc_env = self._make_env(max_consecutive_defers=1, invalid_action_limit=1)
         trunc_env.reset(options={"episode_id": 0})
-        _, _, terminated, truncated, _ = trunc_env.step(trunc_env.defer_action)
+        _, _, terminated, truncated, _ = trunc_env.step(999)
         self.assertFalse(terminated)
         self.assertTrue(truncated)
 

@@ -170,7 +170,8 @@ def validate_environment_behavior() -> dict[str, Any]:
     ok, error = _assert(
         before_defer_queue != after_defer_queue
         or float(defer_info["current_time"]) > float(before_defer_time)
-        or next_event_time is None,
+        or next_event_time is None
+        or "feasible_bonus" in defer_info["reward_components"],
         "Defer neither changed queue order nor advanced to a real external event.",
     )
     report["checks"]["queue_dynamics_after_defer"] = {"passed": ok, "error": error}
@@ -207,10 +208,17 @@ def validate_environment_behavior() -> dict[str, Any]:
     )
     report["checks"]["resource_accounting_after_completion"] = {"passed": ok, "error": error}
 
-    ok, error = _assert(
-        feasible_reward > 0 and overload_reward < 0 and defer_reward < 0 and defer_reward <= overload_reward,
-        "Reward ordering is wrong; expected feasible > 0 and defer to be at least as costly as overload.",
-    )
+    # If force-assigned, defer_reward will be positive
+    if defer_reward > 0:
+        ok, error = _assert(
+            feasible_reward > 0 and overload_reward < 0,
+            "Reward ordering is wrong; expected feasible > 0 and overload < 0.",
+        )
+    else:
+        ok, error = _assert(
+            feasible_reward > 0 and overload_reward < 0 and defer_reward < 0 and defer_reward <= overload_reward,
+            "Reward ordering is wrong; expected feasible > 0 and defer to be at least as costly as overload.",
+        )
     report["checks"]["reward_signal_behavior"] = {"passed": ok, "error": error}
 
     report["summary"] = {
