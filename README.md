@@ -40,15 +40,11 @@
 
 The system treats task scheduling as a **sequential decision problem** where an RL agent learns to assign incoming cloud tasks to machines in real time.
 
-<div align="center">
-  <img src="docs/architecture.png" alt="System Architecture" width="700"/>
-</div>
-
 ```
-Google Cloud Trace → Preprocessing → Gym Environment → MaskablePPO Agent → Evaluation
-                                           ↕                    ↕
-                                    Action Masking      Cross-Attention
-                                    Machine Fleet       Policy + Value Networks
+Google Cloud Trace ─→ Data Preprocessing ─→ Gym Environment ─→ MaskablePPO Agent ─→ Evaluation
+                      ├ Feature Eng.         ├ Task Queue Sim    ├ Cross-Attention      ├ vs FCFS
+                      ├ Normalization         ├ Machine Fleet     ├ Policy Network       ├ vs SJF
+                      └ Episode Construction  └ Action Masking    └ Value Network        └ vs RR
 ```
 
 ### RL Formulation
