@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-title: RL-Based Cloud Task Scheduler
+title: AI-Based Deadline-Aware OS Scheduler
 message: If you use this project, please cite it using this metadata.
 type: software
 authors:
@@ -11,3 +11,13 @@ authors:
     given-names: Uday
 repository-code: https://github.com/Arnav-Nehra28/AI-Based-Deadline-Aware-OS-Scheduler
 license: MIT
+date-released: "2025-05-01"
+version: "1.0.0"
+keywords:
+  - reinforcement-learning
+  - task-scheduling
+  - maskable-ppo
+  - gymnasium
+  - cross-attention
+  - deadline-aware
+  - cloud-computing

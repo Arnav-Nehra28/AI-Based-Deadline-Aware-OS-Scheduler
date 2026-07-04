@@ -38,7 +38,35 @@ modeling/training_log.txt
 *.pdf
 *.zip
 *.npz
+*.png
+*.svg
 
 # OS/editor noise
 .DS_Store
 Thumbs.db
+
+# ── Root-level clutter (not part of the core project) ──
+*.pptx
+*.docx
+*.drawio
+chapter*.md
+_temp_*
+pages.txt
+parse_docx*.py
+parse_toc_field.py
+print_*.py
+get_toc_block.py
+generate_ppt.py
+generate_report_charts.py
+plot_normalization.py
+project_documentation.md
+paper/
+
+# Training utilities not part of core pipeline
+training/rl/other_models/
+training/rl/render_project_documentation_pdf.py
+
+# ── Documentation assets (tracked — must come AFTER global ignores) ──
+!docs/
+!docs/*.png
+!docs/*.svg
